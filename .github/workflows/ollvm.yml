@@ -1,0 +1,456 @@
+# Copyright (c) 2025-2026 fei_cong(https://github.com/feicong/feicong-course)
+
+name: ollvm
+
+on:
+  push:
+    branches:
+      - llvm-22.x
+    tags-ignore:
+      - '**'
+    paths-ignore:
+      - LICENSE
+      - '**.md'
+  workflow_dispatch:
+    inputs:
+      rust_repository:
+        description: Rust source repository
+        required: false
+        default: rust-lang/rust
+        type: string
+      rust_ref:
+        description: Rust source branch, tag or commit
+        required: false
+        default: main
+        type: string
+      release_tag:
+        description: Target release tag
+        required: false
+        default: llvm-22.x
+        type: string
+      upload:
+        description: Upload artifacts to release
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare release metadata
+    runs-on: ubuntu-24.04
+    outputs:
+      release_tag: ${{ steps.vars.outputs.release_tag }}
+      rust_repository: ${{ steps.vars.outputs.rust_repository }}
+      rust_ref: ${{ steps.vars.outputs.rust_ref }}
+      rust_ref_safe: ${{ steps.vars.outputs.rust_ref_safe }}
+      release_name: ${{ steps.vars.outputs.release_name }}
+      upload: ${{ steps.vars.outputs.upload }}
+    steps:
+      - name: Compute variables
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rust_repository='rust-lang/rust'
+          rust_ref='main'
+          release_tag='llvm-22.x'
+          upload='true'
+
+          if [ '${{ github.event_name }}' = 'workflow_dispatch' ]; then
+            if [ -n '${{ inputs.rust_repository }}' ]; then
+              rust_repository='${{ inputs.rust_repository }}'
+            fi
+
+            if [ -n '${{ inputs.rust_ref }}' ]; then
+              rust_ref='${{ inputs.rust_ref }}'
+            fi
+
+            if [ -n '${{ inputs.release_tag }}' ]; then
+              release_tag='${{ inputs.release_tag }}'
+            fi
+
+            upload='${{ inputs.upload }}'
+          fi
+
+          rust_ref_safe="$(printf '%s' "$rust_ref" | sed 's/[^A-Za-z0-9._-]/-/g')"
+          release_name="Arkari OLLVM Toolchains (${release_tag})"
+
+          {
+            echo "rust_repository=$rust_repository"
+            echo "rust_ref=$rust_ref"
+            echo "rust_ref_safe=$rust_ref_safe"
+            echo "release_tag=$release_tag"
+            echo "release_name=$release_name"
+            echo "upload=$upload"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.label }} toolchain
+    needs: prepare
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux
+            runs_on: ubuntu-24.04
+            archive_ext: tar.xz
+          - label: macos
+            runs_on: macos-15
+            archive_ext: tar.xz
+          - label: windows
+            runs_on: windows-2025
+            archive_ext: zip
+    env:
+      LLVM_TARGETS_TO_BUILD: AArch64;X86
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Checkout Rust source
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ needs.prepare.outputs.rust_repository }}
+          ref: ${{ needs.prepare.outputs.rust_ref }}
+          path: rust
+          fetch-depth: 1
+
+      - name: Fetch Rust source dependencies
+        shell: bash
+        working-directory: rust
+        run: |
+          set -euo pipefail
+          git submodule update --init --recursive library/backtrace src/tools/cargo
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Setup MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Prioritize MSVC linker
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $msvcBin = Join-Path $env:VCINSTALLDIR "Tools\MSVC\$env:VCToolsVersion\bin\Hostx64\x64"
+          $linkExe = Join-Path $msvcBin "link.exe"
+
+          if (-not (Test-Path $linkExe)) {
+            throw "MSVC linker not found: $linkExe"
+          }
+
+          $msvcBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & where.exe link
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            curl \
+            git \
+            ninja-build \
+            pkg-config \
+            xz-utils
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install ninja
+
+      - name: Install Windows dependencies
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          choco install ninja --yes --no-progress
+          echo "/c/ProgramData/chocolatey/bin" >> "$GITHUB_PATH"
+
+      - name: Detect host triple
+        id: host
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          release_tag_safe="$(printf '%s' '${{ needs.prepare.outputs.release_tag }}' | sed 's/[^A-Za-z0-9._-]/-/g')"
+
+          case "${RUNNER_OS}" in
+            Linux)
+              case "$(uname -m)" in
+                x86_64) host_triple="x86_64-unknown-linux-gnu" ;;
+                aarch64|arm64) host_triple="aarch64-unknown-linux-gnu" ;;
+                *) echo "Unsupported Linux architecture: $(uname -m)" >&2; exit 1 ;;
+              esac
+              llvm_config="$GITHUB_WORKSPACE/ollvm-llvm-install/bin/llvm-config"
+              ;;
+            macOS)
+              case "$(uname -m)" in
+                x86_64) host_triple="x86_64-apple-darwin" ;;
+                arm64) host_triple="aarch64-apple-darwin" ;;
+                *) echo "Unsupported macOS architecture: $(uname -m)" >&2; exit 1 ;;
+              esac
+              llvm_config="$GITHUB_WORKSPACE/ollvm-llvm-install/bin/llvm-config"
+              ;;
+            Windows)
+              case "${PROCESSOR_ARCHITECTURE}" in
+                AMD64) host_triple="x86_64-pc-windows-msvc" ;;
+                ARM64) host_triple="aarch64-pc-windows-msvc" ;;
+                *) echo "Unsupported Windows architecture: ${PROCESSOR_ARCHITECTURE}" >&2; exit 1 ;;
+              esac
+              llvm_config="${GITHUB_WORKSPACE//\\//}/ollvm-llvm-install/bin/llvm-config.exe"
+              ;;
+            *)
+              echo "Unsupported operating system: ${RUNNER_OS}" >&2
+              exit 1
+              ;;
+          esac
+
+          archive_name="arkari-rust-ollvm-toolchain-${release_tag_safe}-${{ needs.prepare.outputs.rust_ref_safe }}-${host_triple}.${{ matrix.archive_ext }}"
+
+          {
+            echo "host_triple=$host_triple"
+            echo "llvm_config=$llvm_config"
+            echo "archive_name=$archive_name"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build LLVM
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cmake_args=(
+            -S llvm
+            -B build/ollvm-llvm
+            -G Ninja
+            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/ollvm-llvm-install"
+            -DLLVM_TARGETS_TO_BUILD="${LLVM_TARGETS_TO_BUILD}"
+            -DLLVM_INSTALL_UTILS=ON
+            -DLLVM_ENABLE_ASSERTIONS=OFF
+            -DLLVM_INCLUDE_TESTS=OFF
+            -DLLVM_BUILD_TESTS=OFF
+            -DLLVM_INCLUDE_EXAMPLES=OFF
+            -DLLVM_INCLUDE_BENCHMARKS=OFF
+            -DLLVM_BUILD_BENCHMARKS=OFF
+            -DLLVM_BUILD_DOCS=OFF
+            -DLLVM_ENABLE_BACKTRACES=OFF
+            -DLLVM_ENABLE_ZLIB=OFF
+            -DLLVM_ENABLE_ZSTD=OFF
+            -DLLVM_ENABLE_LIBXML2=OFF
+            -DLLVM_ENABLE_TERMINFO=OFF
+            -DLLVM_ENABLE_LIBEDIT=OFF
+            -DBUILD_SHARED_LIBS=OFF
+          )
+
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            cmake_args+=(-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded)
+          fi
+
+          cmake "${cmake_args[@]}"
+          cmake --build build/ollvm-llvm --parallel
+          cmake --install build/ollvm-llvm
+
+      - name: Generate Rust config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          {
+            printf '%s\n' \
+              'change-id = 999999' \
+              '' \
+              '[llvm]' \
+              "targets = \"${LLVM_TARGETS_TO_BUILD}\"" \
+              'download-ci-llvm = false' \
+              'link-shared = false' \
+              'ninja = true' \
+              '' \
+              '[build]' \
+              "build = \"${{ steps.host.outputs.host_triple }}\"" \
+              "host = [\"${{ steps.host.outputs.host_triple }}\"]" \
+              "target = [\"${{ steps.host.outputs.host_triple }}\"]" \
+              'extended = true' \
+              'tools = ["cargo"]' \
+              'submodules = false' \
+              '' \
+              '[rust]' \
+              'lld = false' \
+              'llvm-tools = true' \
+              '' \
+              "[target.${{ steps.host.outputs.host_triple }}]" \
+              "llvm-config = \"${{ steps.host.outputs.llvm_config }}\""
+          } > rust/config.toml
+
+      - name: Build Rust stage1
+        shell: bash
+        working-directory: rust
+        run: |
+          set -euo pipefail
+
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            msvc_root="${VCToolsInstallDir:-}"
+            if [ -z "$msvc_root" ]; then
+              msvc_root="${VCINSTALLDIR%\\}\\Tools\\MSVC\\${VCToolsVersion}"
+            fi
+
+            msvc_bin="$(cygpath -u "$msvc_root")/bin/Hostx64/x64"
+            if [ ! -x "$msvc_bin/link.exe" ]; then
+              echo "MSVC linker not found: $msvc_bin/link.exe" >&2
+              exit 1
+            fi
+
+            export PATH="$msvc_bin:$PATH"
+            command -v link
+          fi
+
+          python x.py build --stage 1 compiler/rustc library/std src/tools/cargo
+
+      - name: Package stage1 toolchain
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          archive_path="$GITHUB_WORKSPACE/${{ steps.host.outputs.archive_name }}"
+          stage_dir="rust/build/${{ steps.host.outputs.host_triple }}/stage1"
+          tools_bin_dir="rust/build/${{ steps.host.outputs.host_triple }}/stage1-tools-bin"
+          package_root="$RUNNER_TEMP/ollvm-package"
+          archive_path_output="$archive_path"
+
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            archive_path_output="${archive_path//\//\\}"
+            package_root="$(cygpath -u "$package_root")"
+          fi
+
+          toolchain_dir="$package_root/stage1"
+          if [ ! -d "$stage_dir" ]; then
+            echo "Missing stage1 directory: $stage_dir" >&2
+            exit 1
+          fi
+
+          rm -rf "$package_root"
+          mkdir -p "$toolchain_dir"
+          tar -C "$stage_dir" -cf - . | tar -C "$toolchain_dir" -xf -
+
+          if [ -d "$tools_bin_dir" ]; then
+            mkdir -p "$toolchain_dir/bin"
+            for tool in cargo cargo.exe; do
+              if [ -f "$tools_bin_dir/$tool" ]; then
+                cp "$tools_bin_dir/$tool" "$toolchain_dir/bin/$tool"
+              fi
+            done
+          fi
+
+          rm -rf \
+            "$toolchain_dir/lib/rustlib/rustc-src" \
+            "$toolchain_dir/lib/rustlib/rust-src" \
+            "$toolchain_dir/lib/rustlib/src"
+
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            pdb_count="$(find "$toolchain_dir" -type f -name '*.pdb' | wc -l | tr -d '[:space:]')"
+            if [ "$pdb_count" != "0" ]; then
+              find "$toolchain_dir" -type f -name '*.pdb' -delete
+            fi
+
+            toolchain_dir_native="$(cygpath -w "$toolchain_dir")"
+            powershell -NoProfile -Command \
+              "Compress-Archive -Path '$toolchain_dir_native' -DestinationPath '$archive_path_output' -Force"
+          else
+            tar -C "$package_root" -cJf "$archive_path" stage1
+          fi
+
+          echo "archive_path=$archive_path_output" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.label }}-toolchain
+          path: ${{ steps.package.outputs.archive_path }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish release assets
+    if: ${{ needs.prepare.outputs.upload == 'true' }}
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Update release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f "${{ needs.prepare.outputs.release_tag }}" "${{ github.sha }}"
+          git push origin "refs/tags/${{ needs.prepare.outputs.release_tag }}" --force
+
+      - name: Generate release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          {
+            printf '%s\n' \
+              "Arkari branch: \`${{ github.ref_name }}\`" \
+              "Release tag: \`${{ needs.prepare.outputs.release_tag }}\`" \
+              "Rust source: \`${{ needs.prepare.outputs.rust_repository }}\`" \
+              "Rust ref: \`${{ needs.prepare.outputs.rust_ref }}\`" \
+              "LLVM commit: \`${{ github.sha }}\`" \
+              '' \
+              'These archives contain a `stage1` directory that can be linked directly with `rustup toolchain link`, and include `cargo`.' \
+              '' \
+              'Example:' \
+              '' \
+              '```bash' \
+              'rustup toolchain link arkari-ollvm ./stage1' \
+              'export PATH="$(rustc +arkari-ollvm --print sysroot)/lib/rustlib/$(rustc +arkari-ollvm -vV | sed -n '\''s/^host: //p'\'')/bin:$PATH"' \
+              'RUSTFLAGS="-Cllvm-args=--irobf" cargo +arkari-ollvm build --release' \
+              'cargo +arkari-ollvm -Z build-std=std,panic_abort build --release --target aarch64-unknown-linux-musl' \
+              '```' \
+              '' \
+              'Extra obfuscation switches can be stacked with `--irobf-indbr`, `--irobf-icall`, `--irobf-indgv`, `--irobf-cse`, `--irobf-fla`, `--irobf-cie` and `--irobf-cfe`.'
+          } > release-notes.md
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ needs.prepare.outputs.release_name }}
+          body_path: release-notes.md
+          files: release-assets/*
+          overwrite_files: true
+          make_latest: false
