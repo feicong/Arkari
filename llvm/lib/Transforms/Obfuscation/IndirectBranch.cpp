@@ -197,7 +197,7 @@ struct IndirectBranch : public FunctionPass {
         buildDecrypt.FuncKey = FuncKeys[AddrTBB];
         buildDecrypt.PtrEncKey = PtrEncKey;
         Triple T(M.getTargetTriple());
-        buildDecrypt.PtrAuthKey = T.isAArch64() ? 0 : -1;
+        buildDecrypt.PtrAuthKey = T.isArm64e() ? 0 : -1;
         buildDecrypt.PtrAuthDisc = 0;
 
         auto            TargetPtr = buildPageTableDecryptIR(buildDecrypt);

@@ -207,7 +207,7 @@ struct IndirectGlobalVariable : public FunctionPass {
         buildDecrypt.ModuleKey = GVKeys[GV];
         buildDecrypt.FuncKey = FuncKeys[GV];
         buildDecrypt.PtrEncKey = PtrEncKey;
-        buildDecrypt.PtrAuthKey = T.isAArch64() ? 2 : -1;
+        buildDecrypt.PtrAuthKey = T.isArm64e() ? 2 : -1;
         buildDecrypt.PtrAuthDisc = 0;
         auto        GVPtr = buildPageTableDecryptIR(buildDecrypt);
         IRBuilder<> SIB(DecryptPt);
@@ -255,7 +255,7 @@ struct IndirectGlobalVariable : public FunctionPass {
             buildDecrypt.FuncKey = FuncKeys[GV];
             buildDecrypt.PtrEncKey = PtrEncKey;
             Triple T(M.getTargetTriple());
-            buildDecrypt.PtrAuthKey = T.isAArch64() ? 2 : -1;
+            buildDecrypt.PtrAuthKey = T.isArm64e() ? 2 : -1;
             buildDecrypt.PtrAuthDisc = 0;
             GVPtr = buildPageTableDecryptIR(buildDecrypt);
           }

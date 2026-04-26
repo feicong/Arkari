@@ -211,7 +211,7 @@ struct IndirectCall : public FunctionPass {
         buildDecrypt.ModuleKey = CalleeKeys[Callee];
         buildDecrypt.FuncKey = FuncKeys[Callee];
         buildDecrypt.PtrEncKey = PtrEncKey;
-        buildDecrypt.PtrAuthKey = T.isAArch64() ? 0 : -1;
+        buildDecrypt.PtrAuthKey = T.isArm64e() ? 0 : -1;
         buildDecrypt.PtrAuthDisc = 0;
         auto        DecPtr = buildPageTableDecryptIR(buildDecrypt);
         IRBuilder<> SIB(DecryptPt);
@@ -255,7 +255,7 @@ struct IndirectCall : public FunctionPass {
         buildDecrypt.FuncKey = FuncKeys[Callee];
         buildDecrypt.PtrEncKey = PtrEncKey;
         Triple T(M.getTargetTriple());
-        buildDecrypt.PtrAuthKey = T.isAArch64() ? 0 : -1;
+        buildDecrypt.PtrAuthKey = T.isArm64e() ? 0 : -1;
         buildDecrypt.PtrAuthDisc = 0;
         auto FnPtr = buildPageTableDecryptIR(buildDecrypt);
         FnPtr->setName("Call_" + Callee->getName());
